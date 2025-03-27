@@ -1,0 +1,5 @@
+openai==1.12.0
+SpeechRecognition
+pyttsx3==2.7
+pyaudio==0.2.14
+python-dotenv==1.0.1 

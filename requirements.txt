@@ -151,12 +151,12 @@ pyserial==3.5
 pysmbc==1.0.23
 python-apt==2.6.0
 python-dateutil==2.8.2
-python-dotenv==0.21.0
+python-dotenv==1.0.1
 python-engineio==4.8.0
 python-json-logger==2.0.7
 python-prctl==1.8.1
 python-socketio==5.11.0
-pyttsx3==2.7
+pyttsx3==2.90
 pytz==2022.7.1
 pyudev==0.24.0
 PyYAML==6.0.1
@@ -348,3 +348,5 @@ wrapt==1.14.1
 wsproto==1.2.0
 zipp==1.0.0
 depthai
+openai==1.12.0
+SpeechRecognition==3.10.1
