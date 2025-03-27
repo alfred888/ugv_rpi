@@ -77,7 +77,7 @@ class VoiceChat:
         """运行语音对话程序"""
         print("语音聊天机器人已启动！")
         print(f'请说"{self.wake_word}"来唤醒我')
-        print("说"退出"结束对话")
+        print('说"退出"结束对话')
         
         while True:
             user_input = self.listen()
