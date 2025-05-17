@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>实时图像描述系统</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .video-container {
+            width: 100%;
+            margin-bottom: 20px;
+        }
+        #videoElement {
+            width: 100%;
+            border-radius: 4px;
+        }
+        .status {
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 4px;
+        }
+        .connected {
+            background-color: #d4edda;
+            color: #155724;
+        }
+        .disconnected {
+            background-color: #f8d7da;
+            color: #721c24;
+        }
+        .description {
+            margin-top: 20px;
+            padding: 15px;
+            background-color: #e9ecef;
+            border-radius: 4px;
+        }
+        .settings {
+            margin: 20px 0;
+            padding: 15px;
+            background-color: #e9ecef;
+            border-radius: 4px;
+        }
+        input[type="text"] {
+            width: 100%;
+            padding: 8px;
+            margin: 5px 0;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+        button {
+            background-color: #007bff;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>实时图像描述系统</h1>
+        
+        <div class="settings">
+            <h2>服务器设置</h2>
+            <input type="text" id="serverUrl" placeholder="输入服务器WebSocket地址 (例如: ws://192.168.1.100:5000/ws)" value="ws://localhost:5000/ws">
+            <button onclick="connectWebSocket()">连接服务器</button>
+        </div>
+
+        <div id="connectionStatus" class="status disconnected">
+            未连接到服务器
+        </div>
+
+        <div class="video-container">
+            <video id="videoElement" autoplay></video>
+        </div>
+
+        <div class="description">
+            <h2>图像描述</h2>
+            <div id="descriptionText">等待连接...</div>
+        </div>
+    </div>
+
+    <script>
+        let ws = null;
+        const videoElement = document.getElementById('videoElement');
+        const statusElement = document.getElementById('connectionStatus');
+        const descriptionElement = document.getElementById('descriptionText');
+        const serverUrlInput = document.getElementById('serverUrl');
+
+        // 显示本地摄像头画面
+        if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+            navigator.mediaDevices.getUserMedia({ video: true })
+                .then(function(stream) {
+                    videoElement.srcObject = stream;
+                    videoElement.play();
+                })
+                .catch(function(err) {
+                    videoElement.poster = "";
+                    alert("无法访问摄像头: " + err.message);
+                });
+        } else {
+            alert("当前浏览器不支持摄像头访问");
+        }
+
+        // 连接WebSocket
+        function connectWebSocket() {
+            if (ws) {
+                ws.close();
+            }
+
+            const serverUrl = serverUrlInput.value;
+            ws = new WebSocket(serverUrl);
+
+            ws.onopen = function() {
+                statusElement.textContent = '已连接到服务器';
+                statusElement.className = 'status connected';
+                descriptionElement.textContent = '等待图像描述...';
+            };
+
+            ws.onclose = function() {
+                statusElement.textContent = '与服务器断开连接';
+                statusElement.className = 'status disconnected';
+                descriptionElement.textContent = '连接已断开';
+            };
+
+            ws.onerror = function(error) {
+                console.error('WebSocket错误:', error);
+                statusElement.textContent = '连接错误';
+                statusElement.className = 'status disconnected';
+            };
+
+            ws.onmessage = function(event) {
+                try {
+                    const data = JSON.parse(event.data);
+                    if (data.type === 'description') {
+                        descriptionElement.textContent = data.content;
+                    }
+                } catch (e) {
+                    console.error('解析消息错误:', e);
+                }
+            };
+        }
+
+        // 页面加载完成后自动连接
+        window.onload = function() {
+            connectWebSocket();
+        };
+
+        function fetchResult() {
+            fetch('/result')
+                .then(res => res.json())
+                .then(data => {
+                    let content = data.result;
+                    try {
+                        // 兼容JSON字符串和纯文本
+                        let obj = JSON.parse(content);
+                        if (obj.content) content = obj.content;
+                    } catch (e) {}
+                    document.getElementById('descContent').textContent = content || '暂无描述';
+                });
+        }
+        setInterval(fetchResult, 2000);
+    </script>
+</body>
+</html> 
