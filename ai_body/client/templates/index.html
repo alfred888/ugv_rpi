@@ -21,10 +21,17 @@
         .video-container {
             width: 100%;
             margin-bottom: 20px;
+            min-height: 480px;
+            background-color: #000;
+            display: flex;
+            align-items: center;
+            justify-content: center;
         }
         #videoElement {
             width: 100%;
+            max-height: 480px;
             border-radius: 4px;
+            object-fit: contain;
         }
         .status {
             padding: 10px;
@@ -45,29 +52,14 @@
             background-color: #e9ecef;
             border-radius: 4px;
         }
-        .settings {
-            margin: 20px 0;
-            padding: 15px;
-            background-color: #e9ecef;
+        #debugInfo {
+            margin-top: 20px;
+            padding: 10px;
+            background-color: #f8f9fa;
             border-radius: 4px;
-        }
-        input[type="text"] {
-            width: 100%;
-            padding: 8px;
-            margin: 5px 0;
-            border: 1px solid #ddd;
-            border-radius: 4px;
-        }
-        button {
-            background-color: #007bff;
-            color: white;
-            border: none;
-            padding: 10px 20px;
-            border-radius: 4px;
-            cursor: pointer;
-        }
-        button:hover {
-            background-color: #0056b3;
+            font-family: monospace;
+            white-space: pre-wrap;
+            display: none;
         }
     </style>
 </head>
@@ -75,24 +67,20 @@
     <div class="container">
         <h1>实时图像描述系统</h1>
         
-        <div class="settings">
-            <h2>服务器设置</h2>
-            <input type="text" id="serverUrl" placeholder="输入服务器WebSocket地址 (例如: ws://192.168.1.100:5000/ws)" value="ws://localhost:5000/ws">
-            <button onclick="connectWebSocket()">连接服务器</button>
-        </div>
-
         <div id="connectionStatus" class="status disconnected">
             未连接到服务器
         </div>
 
         <div class="video-container">
-            <video id="videoElement" autoplay></video>
+            <img id="videoElement" alt="等待摄像头画面...">
         </div>
 
         <div class="description">
             <h2>图像描述</h2>
             <div id="descriptionText">等待连接...</div>
         </div>
+
+        <div id="debugInfo"></div>
     </div>
 
     <script>
@@ -100,21 +88,15 @@
         const videoElement = document.getElementById('videoElement');
         const statusElement = document.getElementById('connectionStatus');
         const descriptionElement = document.getElementById('descriptionText');
-        const serverUrlInput = document.getElementById('serverUrl');
+        const debugInfo = document.getElementById('debugInfo');
+        let reconnectAttempts = 0;
+        const maxReconnectAttempts = 5;
 
-        // 显示本地摄像头画面
-        if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-            navigator.mediaDevices.getUserMedia({ video: true })
-                .then(function(stream) {
-                    videoElement.srcObject = stream;
-                    videoElement.play();
-                })
-                .catch(function(err) {
-                    videoElement.poster = "";
-                    alert("无法访问摄像头: " + err.message);
-                });
-        } else {
-            alert("当前浏览器不支持摄像头访问");
+        function log(message) {
+            const timestamp = new Date().toLocaleTimeString();
+            debugInfo.style.display = 'block';
+            debugInfo.textContent += `[${timestamp}] ${message}\n`;
+            console.log(message);
         }
 
         // 连接WebSocket
@@ -123,58 +105,67 @@
                 ws.close();
             }
 
-            const serverUrl = serverUrlInput.value;
-            ws = new WebSocket(serverUrl);
+            const wsUrl = `ws://${window.location.host}/ws`;
+            log(`尝试连接到: ${wsUrl}`);
 
-            ws.onopen = function() {
-                statusElement.textContent = '已连接到服务器';
-                statusElement.className = 'status connected';
-                descriptionElement.textContent = '等待图像描述...';
-            };
+            try {
+                ws = new WebSocket(wsUrl);
 
-            ws.onclose = function() {
-                statusElement.textContent = '与服务器断开连接';
-                statusElement.className = 'status disconnected';
-                descriptionElement.textContent = '连接已断开';
-            };
+                ws.onopen = function() {
+                    log('WebSocket连接已建立');
+                    statusElement.textContent = '已连接到服务器';
+                    statusElement.className = 'status connected';
+                    descriptionElement.textContent = '等待图像描述...';
+                    reconnectAttempts = 0;
+                };
 
-            ws.onerror = function(error) {
-                console.error('WebSocket错误:', error);
-                statusElement.textContent = '连接错误';
-                statusElement.className = 'status disconnected';
-            };
+                ws.onclose = function(event) {
+                    log(`WebSocket连接已关闭: ${event.code} ${event.reason}`);
+                    statusElement.textContent = '与服务器断开连接';
+                    statusElement.className = 'status disconnected';
+                    descriptionElement.textContent = '连接已断开';
 
-            ws.onmessage = function(event) {
-                try {
-                    const data = JSON.parse(event.data);
-                    if (data.type === 'description') {
-                        descriptionElement.textContent = data.content;
+                    if (reconnectAttempts < maxReconnectAttempts) {
+                        reconnectAttempts++;
+                        log(`尝试重新连接 (${reconnectAttempts}/${maxReconnectAttempts})...`);
+                        setTimeout(connectWebSocket, 1000);
+                    } else {
+                        log('达到最大重连次数，停止重连');
                     }
-                } catch (e) {
-                    console.error('解析消息错误:', e);
-                }
-            };
+                };
+
+                ws.onerror = function(error) {
+                    log(`WebSocket错误: ${error}`);
+                    statusElement.textContent = '连接错误';
+                    statusElement.className = 'status disconnected';
+                };
+
+                ws.onmessage = function(event) {
+                    try {
+                        const data = JSON.parse(event.data);
+                        if (data.type === 'frame') {
+                            // 更新摄像头画面
+                            videoElement.src = `data:image/jpeg;base64,${data.data}`;
+                            log('收到新的画面帧');
+                        } else if (data.type === 'description') {
+                            // 更新描述文本
+                            descriptionElement.textContent = data.content;
+                            log(`收到描述结果: ${data.content}`);
+                        }
+                    } catch (e) {
+                        log(`解析消息错误: ${e}`);
+                    }
+                };
+            } catch (e) {
+                log(`创建WebSocket连接时出错: ${e}`);
+            }
         }
 
         // 页面加载完成后自动连接
         window.onload = function() {
+            log('页面已加载，开始连接...');
             connectWebSocket();
         };
-
-        function fetchResult() {
-            fetch('/result')
-                .then(res => res.json())
-                .then(data => {
-                    let content = data.result;
-                    try {
-                        // 兼容JSON字符串和纯文本
-                        let obj = JSON.parse(content);
-                        if (obj.content) content = obj.content;
-                    } catch (e) {}
-                    document.getElementById('descContent').textContent = content || '暂无描述';
-                });
-        }
-        setInterval(fetchResult, 2000);
     </script>
 </body>
 </html> 

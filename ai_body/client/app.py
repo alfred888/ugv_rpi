@@ -2,7 +2,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
 import uvicorn
-from typing import List
+from typing import List, Dict
 import json
 import asyncio
 import cv2
@@ -13,6 +13,8 @@ import queue
 import logging
 from logging.handlers import RotatingFileHandler
 import sys
+import websockets
+import base64
 
 app = FastAPI()
 
@@ -20,6 +22,9 @@ app = FastAPI()
 IMAGE_WIDTH = 640  # 压缩后的图片宽度
 IMAGE_QUALITY = 85  # JPEG压缩质量（0-100）
 JPEG_EXTENSION = '.jpg'
+
+# 服务器配置
+SERVER_WS_URL = "ws://192.168.0.69:5000/ws"  # 服务器WebSocket地址
 
 # 日志配置
 LOG_DIR = os.path.expanduser("~/ml-fastvlm-logs")
@@ -59,6 +64,8 @@ logger.addHandler(console_handler)
 camera = None
 capture_lock = threading.Lock()
 active_connections: List[WebSocket] = []
+web_connections: Dict[WebSocket, bool] = {}  # 网页WebSocket连接
+frame_queue = queue.Queue(maxsize=2)  # 用于存储最新的帧
 
 # 创建图片保存目录
 IMAGE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "captured_images")
@@ -72,13 +79,35 @@ def get_camera():
     """获取摄像头对象"""
     global camera
     if camera is None:
-        camera = cv2.VideoCapture(0)
-        # 设置摄像头参数
-        camera.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
-        camera.set(cv2.CAP_PROP_EXPOSURE, -4)
-        camera.set(cv2.CAP_PROP_GAIN, 100)
-        camera.set(cv2.CAP_PROP_BRIGHTNESS, 150)
-        logger.info("📹 摄像头初始化完成")
+        try:
+            # 尝试不同的摄像头索引
+            for i in range(2):  # 尝试前两个摄像头索引
+                camera = cv2.VideoCapture(i)
+                if camera.isOpened():
+                    ret, frame = camera.read()
+                    if ret and frame is not None:
+                        logger.info(f"📹 成功打开摄像头 {i}")
+                        # 设置摄像头参数
+                        camera.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
+                        camera.set(cv2.CAP_PROP_EXPOSURE, -4)
+                        camera.set(cv2.CAP_PROP_GAIN, 100)
+                        camera.set(cv2.CAP_PROP_BRIGHTNESS, 150)
+                        return camera
+                    else:
+                        camera.release()
+                        logger.warning(f"摄像头 {i} 无法读取画面")
+                else:
+                    logger.warning(f"无法打开摄像头 {i}")
+            
+            # 如果所有尝试都失败，使用默认摄像头
+            camera = cv2.VideoCapture(0)
+            if not camera.isOpened():
+                raise Exception("无法打开任何摄像头")
+            
+            logger.info("📹 摄像头初始化完成")
+        except Exception as e:
+            logger.error(f"❌ 摄像头初始化失败: {e}")
+            raise
     return camera
 
 def compress_image(frame):
@@ -105,88 +134,187 @@ def save_image(frame, filepath):
     
     return compressed
 
-async def capture_and_send(websocket):
-    """捕获图片并发送到服务器"""
+async def capture_frames():
+    """持续捕获摄像头画面"""
+    global camera
     while True:
-        with capture_lock:
-            try:
-                camera = get_camera()
-                ret, frame = camera.read()
-                if not ret:
-                    logger.error("❌ 无法读取摄像头画面")
-                    await asyncio.sleep(1)
-                    continue
+        try:
+            camera = get_camera()
+            if camera is None:
+                logger.error("❌ 摄像头未初始化")
+                await asyncio.sleep(1)
+                continue
 
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                filename = f"captured_image_{timestamp}{JPEG_EXTENSION}"
-                filepath = os.path.join(IMAGE_DIR, filename)
-                
-                # 保存压缩后的图片
-                compressed_frame = save_image(frame, filepath)
-                logger.info(f"📸 图片已保存到: {filepath}")
-                
-                # 读取压缩后的图片数据
-                with open(filepath, 'rb') as f:
-                    image_data = f.read()
-                
-                # 发送图片数据到服务器
-                await websocket.send_bytes(image_data)
-                logger.info("📤 图片数据已发送到服务器")
-                
-                # 删除临时文件
+            ret, frame = camera.read()
+            if not ret or frame is None:
+                logger.error("❌ 无法读取摄像头画面")
+                camera = None
+                await asyncio.sleep(1)
+                continue
+
+            # 压缩图片
+            compressed = compress_image(frame)
+            
+            # 将图片转换为JPEG格式
+            _, buffer = cv2.imencode('.jpg', compressed, [cv2.IMWRITE_JPEG_QUALITY, IMAGE_QUALITY])
+            jpeg_data = buffer.tobytes()
+            
+            # 更新帧队列
+            if not frame_queue.full():
+                frame_queue.put(jpeg_data)
+            else:
                 try:
-                    os.remove(filepath)
-                    logger.info(f"🗑️ 临时文件已删除: {filepath}")
-                except Exception as e:
-                    logger.error(f"⚠️ 删除临时文件失败: {e}")
-                
-            except Exception as e:
-                logger.error(f"❌ 处理过程出错: {e}")
+                    frame_queue.get_nowait()  # 移除旧帧
+                    frame_queue.put(jpeg_data)  # 添加新帧
+                except queue.Empty:
+                    pass
+
+        except Exception as e:
+            logger.error(f"❌ 捕获画面时出错: {e}")
+            camera = None
         
-        await asyncio.sleep(5)  # 每5秒拍摄一次
+        await asyncio.sleep(1)  # 每秒捕获一次
+
+async def broadcast_frames():
+    """向所有网页连接广播最新的帧"""
+    while True:
+        try:
+            if not frame_queue.empty():
+                frame_data = frame_queue.get()
+                # 将二进制数据转换为base64字符串
+                frame_base64 = base64.b64encode(frame_data).decode('utf-8')
+                
+                # 向所有网页连接发送帧
+                for websocket in list(web_connections.keys()):
+                    try:
+                        await websocket.send_json({
+                            "type": "frame",
+                            "data": frame_base64
+                        })
+                    except:
+                        # 如果发送失败，移除连接
+                        web_connections.pop(websocket, None)
+        except Exception as e:
+            logger.error(f"❌ 广播画面时出错: {e}")
+        
+        await asyncio.sleep(0.1)  # 每100ms检查一次
+
+async def send_to_server():
+    """将捕获的画面发送到服务器"""
+    while True:
+        try:
+            async with websockets.connect(SERVER_WS_URL) as websocket:
+                logger.info("🔌 已连接到服务器")
+                
+                while True:
+                    try:
+                        if not frame_queue.empty():
+                            frame_data = frame_queue.get()
+                            await websocket.send(frame_data)
+                            logger.info("📤 图片数据已发送到服务器")
+                            
+                            # 等待服务器返回的描述结果
+                            data = await websocket.recv()
+                            try:
+                                result = json.loads(data)
+                                if result.get("type") == "description":
+                                    logger.info(f"📥 收到服务器描述结果: {result.get('content')}")
+                                    # 广播描述结果给所有网页连接
+                                    for ws in list(web_connections.keys()):
+                                        try:
+                                            await ws.send_json(result)
+                                        except:
+                                            web_connections.pop(ws, None)
+                            except json.JSONDecodeError:
+                                logger.error("❌ 收到无效的JSON数据")
+                    except websockets.exceptions.ConnectionClosed:
+                        logger.info("🔌 与服务器的连接已断开")
+                        break
+                    except Exception as e:
+                        logger.error(f"❌ 处理服务器通信时出错: {e}")
+                        break
+                
+        except Exception as e:
+            logger.error(f"❌ 连接服务器时出错: {e}")
+        
+        await asyncio.sleep(5)  # 等待一段时间后重试连接
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    """WebSocket 连接处理"""
+    """处理网页WebSocket连接"""
     await websocket.accept()
-    active_connections.append(websocket)
-    logger.info("🔌 新的WebSocket连接已建立")
+    web_connections[websocket] = True
+    logger.info("🔌 新的网页连接已建立")
+    
     try:
-        # 启动图片捕获和发送任务
-        capture_task = asyncio.create_task(capture_and_send(websocket))
-        
-        # 等待服务器返回的描述结果
         while True:
-            data = await websocket.receive_text()
-            try:
-                result = json.loads(data)
-                if result.get("type") == "description":
-                    logger.info("📥 收到服务器描述结果")
-                    # 广播描述结果给所有连接的客户端
-                    for connection in active_connections:
-                        try:
-                            await connection.send_json(result)
-                        except:
-                            continue
-            except json.JSONDecodeError:
-                logger.error("❌ 收到无效的JSON数据")
-                
+            # 保持连接活跃
+            await websocket.receive_text()
     except WebSocketDisconnect:
-        active_connections.remove(websocket)
-        logger.info("🔌 WebSocket连接已断开")
-        if 'capture_task' in locals():
-            capture_task.cancel()
+        web_connections.pop(websocket, None)
+        logger.info("🔌 网页连接已断开")
 
 # 挂载静态文件
-app.mount("/static", StaticFiles(directory="static"), name="static")
+app.mount("/static", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")), name="static")
 
 @app.get("/", response_class=HTMLResponse)
 async def get():
     """返回主页"""
-    with open("templates/index.html") as f:
-        return f.read()
+    try:
+        template_path = os.path.join(os.path.dirname(__file__), "templates", "index.html")
+        if not os.path.exists(template_path):
+            logger.error(f"❌ 模板文件不存在: {template_path}")
+            return HTMLResponse(content="<h1>错误：找不到模板文件</h1>", status_code=500)
+        
+        with open(template_path, "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception as e:
+        logger.error(f"❌ 读取模板文件时出错: {e}")
+        return HTMLResponse(content="<h1>错误：无法读取模板文件</h1>", status_code=500)
 
 if __name__ == "__main__":
     logger.info("🚀 启动树莓派客户端...")
     logger.info(f"📁 日志文件位置: {LOG_FILE}")
-    uvicorn.run(app, host="0.0.0.0", port=8080) 
+    
+    # 检查必要的目录和文件
+    template_dir = os.path.join(os.path.dirname(__file__), "templates")
+    static_dir = os.path.join(os.path.dirname(__file__), "static")
+    
+    if not os.path.exists(template_dir):
+        logger.error(f"❌ 模板目录不存在: {template_dir}")
+        sys.exit(1)
+    
+    if not os.path.exists(static_dir):
+        logger.error(f"❌ 静态文件目录不存在: {static_dir}")
+        sys.exit(1)
+    
+    template_file = os.path.join(template_dir, "index.html")
+    if not os.path.exists(template_file):
+        logger.error(f"❌ 模板文件不存在: {template_file}")
+        sys.exit(1)
+    
+    logger.info("✅ 所有必要的文件和目录检查通过")
+    
+    # 创建事件循环
+    loop = asyncio.get_event_loop()
+    
+    # 启动所有任务
+    tasks = [
+        loop.create_task(capture_frames()),
+        loop.create_task(broadcast_frames()),
+        loop.create_task(send_to_server())
+    ]
+    
+    # 启动FastAPI服务器
+    config = uvicorn.Config(app, host="0.0.0.0", port=8080, loop=loop)
+    server = uvicorn.Server(config)
+    try:
+        loop.run_until_complete(server.serve())
+    except KeyboardInterrupt:
+        logger.info("收到退出信号，正在关闭...")
+    finally:
+        for task in tasks:
+            task.cancel()
+        loop.stop()
+        loop.close()
+        logger.info("服务已关闭。") 
